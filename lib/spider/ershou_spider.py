@@ -3,7 +3,9 @@
 # author: zengyuetian
 # 此代码仅供学习与交流，请勿用于商业用途。
 # 爬取二手房数据的爬虫派生类
-
+import datetime
+from datetime import timedelta
+import glob
 import re
 import threadpool
 from bs4 import BeautifulSoup
@@ -29,8 +31,9 @@ class ErShouSpider(BaseSpider):
         """
         district_name = area_dict.get(area_name, "")
         csv_file = self.today_path + "/{0}_{1}.csv".format(district_name, area_name)
-
-        ershous = self.get_area_ershou_info(city_name, area_name)
+        csv_file_compared = read_recent_csv(self.save_path,district_name, area_name)
+        csv_file_compared_pd = pd.read_csv(csv_file_compared,index_col=0)
+        ershous = self.get_area_ershou_info(city_name, area_name,csv_file_compared)
             # 锁定，多线程读写
         if self.mutex.acquire(1):
             self.total_num += len(ershous)
@@ -49,13 +52,18 @@ class ErShouSpider(BaseSpider):
 
 
 
-    def get_area_ershou_info(city_name, area_name):
+    def get_area_ershou_info(city_name, area_name,file_to_compare,update_from_existing_file=1 ):
         """
         通过爬取页面获得城市指定版块的二手房信息
         :param city_name: 城市
         :param area_name: 版块
+        :file_to_compare: 最新数据的文件名
+        :update_from_existing_file:控制是否需要基于最新数据进行更新，全遍历需要较多时间。
+
         :return: 二手房数据列表
         """
+        file_pd = pd.read_csv(file_to_compare,index_col=0)
+        urls_comp = file_pd['信息网址'].to_list()
         total_page = 1
         district_name = area_dict.get(area_name, "")
         # 中文区县
@@ -79,11 +87,13 @@ class ErShouSpider(BaseSpider):
         except Exception as e:
             print("\tWarning: only find one page for {0}".format(area_name))
             print(e)
+        detail_urls =[]
+        url_price = pd.DataFrame(columns=['url','price','unitPrice'])
 
         # 从第一页开始,一直遍历到最后一页
         for num in range(1, total_page + 1):
             page = 'http://{0}.{1}.com/ershoufang/{2}/pg{3}'.format(city_name, SPIDER_NAME, area_name, num)
-            print(page)  # 打印每一页的地址
+            #print(page)  # 打印每一页的地址
             headers = create_headers()
             BaseSpider.random_delay()
             response = requests.get(page, timeout=10, headers=headers)
@@ -92,22 +102,43 @@ class ErShouSpider(BaseSpider):
             soup = BeautifulSoup(html, "lxml")
             # 获得有小区信息的panel
             house_elements = soup.find_all('li', class_="clear")
-            detail_urls =[]
 
             for house_elem in house_elements:
                 #print('house_elem:',house_elem)
                 detail_url = house_elem.find('a')['href']
                 detail_urls.append(detail_url)
-            for url in detail_urls:
+                price = house_elem.find('div', class_="totalPrice")
+                price = price.text.strip().replace('万','').replace('\n','')
+                unitprice = house_elem.find('div', class_="unitPrice")
+                unitprice = unitprice.text.strip().replace('元/平','').replace('\n','')
+                url_price = pd.concat([url_price,pd.DataFrame({'url':[detail_url],'price':[price],'unitPrice':[unitprice]})],axis=0)       
+        #与现有csv文件相比，筛选出新的url，并进行信息下载与读取
+        detail_urls = url_price['url'].to_list()
+        urls_existed  = set(urls_comp)&set(detail_urls)
+        urls_download = set(detail_urls)- urls_existed
+        urls_expired  = set(urls_comp)- urls_existed
+        if update_from_existing_file==1:
+            for url in list(urls_existed):
+                mes1 = file_pd[file_pd['信息网址'] == url].to_dict(orient = 'records')
+                price = url_price[url_price['url']==url]['price'].iloc[0]
+                unitprice = url_price[url_price['url']==url]['unitPrice'].iloc[0]
+                mes1[0]['价格(万)'] = price
+                mes1[0]['元/平方米'] = unitprice
+                ershou_list.append(mes1)
+            for url in list(urls_download):
                 mes1 = totalInform(url)
                 ershou_list.append(mes1)
-        print(f'Total records{len(ershou_list)} in {city_name},{district_name},{area_name}')
+        else:
+            for url in list(detail_urls):
+                mes1 = totalInform(url)
+                ershou_list.append(mes1)
+        print(f'Total records {len(ershou_list)} in {city_name},{district_name},{area_name}; new records number is {len(urls_download)}; expired records number is {len(urls_expired)} and existed records is {len(urls_existed)}')
         return ershou_list
 
     def start(self):
         city = get_city()
-        self.today_path = create_date_path("{0}/ershou".format(SPIDER_NAME), city, self.date_string)
-
+        self.save_path = create_date_path("{0}/ershou".format(SPIDER_NAME), city,'')
+        self.today_path = create_date_path("{0}/ershou".format(SPIDER_NAME), city, self.date_string)            
         t1 = time.time()  # 开始计时
 
         # 获得城市有多少区列表, district: 区县
@@ -128,6 +159,7 @@ class ErShouSpider(BaseSpider):
         print("Area:", areas)
         print("District and areas:", area_dict)
 
+    
         # 准备线程池用到的参数
         nones = [None for i in range(len(areas))]
         city_list = [city for i in range(len(areas))]
@@ -147,7 +179,33 @@ class ErShouSpider(BaseSpider):
         print("Total crawl {0} areas.".format(len(areas)))
         print("Total cost {0} second to crawl {1} data items.".format(t2 - t1, self.total_num))
 
+def find_recent_update_date(file_path):
+    '''
+    返回最新csv数据所在文件夹对应的时间
+    '''
+    dates_str = os.listdir(file_path)
+    date_time = []
+    for date in dates_str:
+        file_dir = os.path.join(file_path,date)
+        files = os.listdir(file_dir)
+        if len(files)>=50:
+            date_time.append(datetime.datetime.strptime(date,'%Y%m%d'))
+    return  max(date_time)
+
+def read_recent_csv(file_path,district_name, area_name):
+    '''
+    读取对应最新的csv文件，用以后续的数据更新功能，避免更新所有重复数据所带来的巨大的时间开销
+    '''
+    date_time = find_recent_update_date(file_path)
+    csv_file = file_path+datetime.datetime.strftime(date_time,'%Y%m%d') + "/{0}_{1}.csv".format(district_name, area_name)
+    return csv_file
+
+
+
 def get_area_ershou_info_url(url):
+    '''
+    读取url对应的网址页面信息
+    '''
     headers = create_headers()
     response = requests.get(url, timeout=10, headers=headers)
     html = response.content
